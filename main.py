@@ -1,127 +1,106 @@
+import time
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
 import akshare as ak
 import pandas as pd
-import time
-import requests
 
-app = FastAPI(title="股市分析助手 V4 - 数据引擎 API")
+app = FastAPI(title="Stock Data Fetcher API", description="纯净股票数据搬运工")
 
-# 配置 CORS，允许跨域请求
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ================= 全局缓存区 (保护 Render 内存与接口限流) =================
-# 缓存全市场数据，每 10 分钟只允许请求一次
-CACHE = {
-    "market_data": None,
-    "last_update": 0,
-    "cache_duration": 600  # 10 分钟缓存
-}
-
-def get_cached_market_data():
-    """获取全市场快照数据（带缓存机制）"""
-    current_time = time.time()
-    if CACHE["market_data"] is None or (current_time - CACHE["last_update"] > CACHE["cache_duration"]):
+def fetch_data_with_retry(fetch_func, *args, **kwargs):
+    """
+    通用容错处理：遇到接口报错或超时，自动执行 3 次重试，每次间隔 10 秒。
+    防范服务器休眠或网络波动导致的采集失败。
+    """
+    max_retries = 3
+    for attempt in range(max_retries):
         try:
-            # 获取东财全市场 A 股实时快照
-            df = ak.stock_zh_a_spot_em()
-            CACHE["market_data"] = df
-            CACHE["last_update"] = current_time
+            return fetch_func(*args, **kwargs)
         except Exception as e:
-            if CACHE["market_data"] is None:
-                raise HTTPException(status_code=500, detail="数据源获取失败")
-    return CACHE["market_data"]
-
-# ================= 核心接口 1：个股深度行情 (包含 MACD 与 资金流) =================
-
-@app.get("/api/stock/price")
-def get_stock_price(code: str, detail: bool = False):
-    """
-    获取个股深度行情。
-    当 detail=true 时，返回 MACD (DIF, DEA, Hist) 和 大单资金流向。
-    """
-    result = {"code": code}
-    
-    if detail:
-        try:
-            # 1. 获取最近 100 天数据用于精准计算最新的 MACD 
-            # (Pandas 计算 EMA 需要前置数据平滑)
-            hist_df = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq")
-            if not hist_df.empty:
-                close_prices = hist_df['收盘']
-                # 使用纯 Pandas 计算 MACD，抛弃臃肿的 TA-Lib
-                ema12 = close_prices.ewm(span=12, adjust=False).mean()
-                ema26 = close_prices.ewm(span=26, adjust=False).mean()
-                dif = ema12 - ema26
-                dea = dif.ewm(span=9, adjust=False).mean()
-                macd_hist = (dif - dea) * 2
-                
-                # 提取最后一个交易日的数值
-                result["macd_dif"] = round(float(dif.iloc[-1]), 3)
-                result["macd_dea"] = round(float(dea.iloc[-1]), 3)
-                result["macd_hist"] = round(float(macd_hist.iloc[-1]), 3)
+            if attempt < max_retries - 1:
+                print(f"抓取异常，10秒后进行第 {attempt + 2} 次重试 (错误信息: {e})")
+                time.sleep(10)
             else:
-                result["macd_dif"] = result["macd_dea"] = result["macd_hist"] = 0.0
+                raise Exception(f"连续 {max_retries} 次拉取失败，请检查网络或目标接口。详细错误: {e}")
 
-            # 2. 获取资金流向 (超大单/大单)
-            # 调用同花顺或东财的资金流接口（此处做容错处理，防止接口变动）
-            try:
-                fund_df = ak.stock_individual_fund_flow(stock=code, market="sh" if code.startswith("6") else "sz")
-                if not fund_df.empty:
-                    # 假设返回字段包含超大单和大单净流入
-                    result["super_in"] = float(fund_df.iloc[-1].get("超大单净流入-净额", 0.0))
-                    result["large_in"] = float(fund_df.iloc[-1].get("大单净流入-净额", 0.0))
-                else:
-                    result["super_in"] = result["large_in"] = 0.0
-            except:
-                result["super_in"] = result["large_in"] = 0.0
-                
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"深度指标计算失败: {str(e)}")
+@app.get("/api/stock/{stock_code}")
+def get_stock_data(stock_code: str):
+    """
+    API 接口：传入股票代码（如 600000 或 000001），返回结构化 JSON
+    """
+    try:
+        # ---------------------------------------------------------
+        # Step 1 & 3: 定位与捕获 (静态基础信息 + 当日实时盘口)
+        # ---------------------------------------------------------
+        def get_realtime_and_info():
+            # 获取 A 股实时行情数据（包含基础信息）
+            df = ak.stock_zh_a_spot_em() 
+            # 过滤出目标股票
+            stock_row = df[df['代码'] == stock_code]
+            if stock_row.empty:
+                return None
+            return stock_row.iloc[0].to_dict()
             
-    return result
-
-# ================= 核心接口 2：RPS 强势股榜单 (使用缓存防止超时) =================
-
-@app.get("/api/rps/top/{period}")
-def get_rps_top(period: int, limit: int = 100):
-    """
-    获取 RPS 涨幅榜。基于 Render 性能限制，我们利用全市场快照的 60日/今年涨幅 来模拟 50/120/250 RPS。
-    """
-    df = get_cached_market_data()
-    
-    # 根据周期选择对应的涨跌幅列进行排序
-    if period <= 60:
-        sort_col = "60日涨跌幅"
-    else:
-        sort_col = "年初至今涨跌幅" # 模拟 120/250 日
+        realtime_data = fetch_data_with_retry(get_realtime_and_info)
         
-    if sort_col not in df.columns:
-        return {"error": f"数据源缺失 {sort_col} 字段"}
+        if not realtime_data:
+            raise HTTPException(status_code=404, detail=f"未找到代码为 {stock_code} 的股票数据")
 
-    # 过滤掉 NaN 数据并排序
-    df_sorted = df.dropna(subset=[sort_col]).sort_values(by=sort_col, ascending=False)
-    
-    # 截取前 limit 名
-    top_stocks = df_sorted.head(limit)
-    
-    results = []
-    for _, row in top_stocks.iterrows():
-        results.append({
-            "code": str(row["代码"]),
-            "name": str(row["名称"]),
-            "increase_rate": float(row[sort_col])
-        })
+        # 组装 info 静态字段 (市值转换为亿元)
+        info_dict = {
+            "code": stock_code,
+            "name": realtime_data.get("名称", "未知"),
+            "industry": realtime_data.get("板块名称", "暂无"), # 视接口具体返回字段而定
+            "total_mv": round(realtime_data.get("总市值", 0) / 100000000, 2), 
+            "pe_ttm": realtime_data.get("市盈率-动态", 0.0),
+            "roe": realtime_data.get("净资产收益率", 0.0) 
+        }
         
-    return {"period": period, "count": len(results), "top_stocks": results}
+        # 组装 realtime 实时盘口与资金快照
+        realtime_dict = {
+            "current_price": realtime_data.get("最新价", 0.0),
+            "volume_ratio": realtime_data.get("量比", 0.0),
+            "turnover_rate": realtime_data.get("换手率", 0.0),
+            "pct_change": realtime_data.get("涨跌幅", 0.0)
+        }
 
-# ================= 健康检查接口 (用于 Render 唤醒) =================
-@app.get("/api/market/stats")
-def market_stats():
-    """用于测试 API 是否存活"""
-    return {"status": "ok", "message": "股市分析助手 V4 数据引擎已上线"}
+        # ---------------------------------------------------------
+        # Step 2: 拉取 (获取历史序列，前复权，最近 250 天)
+        # ---------------------------------------------------------
+        def get_history_k_data():
+            # 强制 adjust="qfq" 获取前复权数据
+            hist_df = ak.stock_zh_a_hist(symbol=stock_code, period="daily", adjust="qfq")
+            # 完整抓取最近 250 个交易日，如果上市不足 250 天则按实际最大天数输出
+            return hist_df.tail(250)
+            
+        history_df = fetch_data_with_retry(get_history_k_data)
+        
+        history_list = []
+        for _, row in history_df.iterrows():
+            history_list.append({
+                "date": str(row["日期"]),
+                "open": round(float(row["开盘"]), 3),
+                "high": round(float(row["最高"]), 3),
+                "low": round(float(row["最低"]), 3),
+                "close": round(float(row["收盘"]), 3),
+                "volume": int(row["成交量"]), 
+                "turnover": round(float(row["换手率"]), 4) # 筹码分布的关键线索
+            })
+
+        # ---------------------------------------------------------
+        # Step 4: 组装输出
+        # ---------------------------------------------------------
+        result = {
+            "info": info_dict,
+            "history": history_list,
+            "realtime": realtime_dict
+        }
+
+        # Step 5: FastAPI 会自动将 result 字典序列化为标准的 JSON 格式输出
+        return result
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    # 运行服务器，默认绑定 8000 端口
+    uvicorn.run(app, host="0.0.0.0", port=8000)
