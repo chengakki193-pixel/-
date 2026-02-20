@@ -45,14 +45,50 @@ def get_stock_data(stock_code: str):
         if not realtime_data:
             raise HTTPException(status_code=404, detail=f"未找到代码为 {stock_code} 的股票数据")
 
+        # 行业字段兼容处理：优先使用板块名称，其次尝试行业/所属行业，空值统一回退为“暂无”
+        industry_value = "暂无"
+        for key in ["板块名称", "行业", "所属行业"]:
+            value = realtime_data.get(key)
+            if pd.notna(value) and str(value).strip():
+                industry_value = str(value).strip()
+                break
+
+        def get_latest_roe_value() -> tuple[float, str]:
+            try:
+                indicator_df = fetch_data_with_retry(
+                    ak.stock_financial_analysis_indicator,
+                    symbol=stock_code,
+                )
+            except Exception:
+                indicator_df = None
+
+            if isinstance(indicator_df, pd.DataFrame) and not indicator_df.empty:
+                candidate_cols = ["净资产收益率(%)", "净资产收益率", "ROE", "ROE(%)"]
+                for col in candidate_cols:
+                    if col in indicator_df.columns:
+                        series = pd.to_numeric(indicator_df[col], errors="coerce").dropna()
+                        if not series.empty:
+                            return round(float(series.iloc[-1]), 4), "financial_indicator"
+
+            realtime_roe_raw = realtime_data.get("净资产收益率")
+            if realtime_roe_raw is not None:
+                try:
+                    return round(float(realtime_roe_raw), 4), "realtime_fallback"
+                except (TypeError, ValueError):
+                    pass
+            return 0.0, "default_zero"
+
+        roe_value, roe_source = get_latest_roe_value()
+
         # 组装 info 静态字段 (市值转换为亿元)
         info_dict = {
             "code": stock_code,
             "name": realtime_data.get("名称", "未知"),
-            "industry": realtime_data.get("板块名称", "暂无"), # 视接口具体返回字段而定
+            "industry": industry_value,
             "total_mv": round(realtime_data.get("总市值", 0) / 100000000, 2), 
             "pe_ttm": realtime_data.get("市盈率-动态", 0.0),
-            "roe": realtime_data.get("净资产收益率", 0.0) 
+            "roe": roe_value,
+            "roe_source": roe_source
         }
         
         # 组装 realtime 实时盘口与资金快照
@@ -75,16 +111,17 @@ def get_stock_data(stock_code: str):
         history_df = fetch_data_with_retry(get_history_k_data)
         
         history_list = []
-        for _, row in history_df.iterrows():
-            history_list.append({
-                "date": str(row["日期"]),
-                "open": round(float(row["开盘"]), 3),
-                "high": round(float(row["最高"]), 3),
-                "low": round(float(row["最低"]), 3),
-                "close": round(float(row["收盘"]), 3),
-                "volume": int(row["成交量"]), 
-                "turnover": round(float(row["换手率"]), 4) # 筹码分布的关键线索
-            })
+        if isinstance(history_df, pd.DataFrame) and not history_df.empty:
+            for _, row in history_df.iterrows():
+                history_list.append({
+                    "date": str(row["日期"]),
+                    "open": round(float(row["开盘"]), 3),
+                    "high": round(float(row["最高"]), 3),
+                    "low": round(float(row["最低"]), 3),
+                    "close": round(float(row["收盘"]), 3),
+                    "volume": int(row["成交量"]), 
+                    "turnover": round(float(row["换手率"]), 4) # 筹码分布的关键线索
+                })
 
         # ---------------------------------------------------------
         # Step 4: 组装输出
